@@ -1,20 +1,332 @@
 """Chemistry Helper: balance chemical equations and calculate yields.
 
-Built with Drafter.  The chemistry math lives in chem.py; this file has
-the State, the pages, the routes and the unit tests.
+Built with Drafter.  Everything is in this one file so it deploys cleanly:
+the chemistry helpers, the State, the pages, the routes and the unit tests.
+
+ADVANCED TECHNIQUE (not covered in class): balancing an equation is done
+with linear algebra.  Each species (reactant or product) is a column of a
+matrix and each element is a row; the entry is how many atoms of that
+element are in one molecule (products are negative).  A set of
+coefficients balances the equation when the matrix times the coefficients
+equals zero.  We find those coefficients with Gaussian elimination that
+uses only whole numbers (so no rounding errors and no extra libraries).
 """
 from drafter import *
 from dataclasses import dataclass
-from chem import (
-    split_equation, parse_formula, build_matrix, find_coefficients,
-    molar_mass, to_subscript,
-)
 
+# Global constants (allowed by the project requirements).
 BALANCE_CHOICE: str = "Balance an equation"
 YIELD_CHOICE: str = "Calculate a yield"
 REACTANT: str = "reactant"
 PRODUCT: str = "product"
 
+set_website_title("Chemistry Helper")
+set_site_information(
+    author="Elena Lewis",
+    description="Balance chemical equations and calculate percent yield.",
+    sources="Drafter documentation (drafter-edu.github.io/drafter). "
+            "LLM conversation: llm_conversation.md",
+    planning=["compsci_projectdesign.pdf"],
+    links=["https://github.com/ellewis-723/chemistry-helper"],
+)
+hide_debug_information()
+set_website_framed(False)
+
+
+# ---------------------------------------------------------------------
+# Chemistry helpers (pure Python, no Drafter)
+# ---------------------------------------------------------------------
+
+# Global constants (allowed by the project requirements).
+ATOMIC_MASSES: dict[str, float] = {
+    "H": 1.008, "He": 4.0026, "Li": 6.94, "Be": 9.0122, "B": 10.81,
+    "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "Ne": 20.180,
+    "Na": 22.990, "Mg": 24.305, "Al": 26.982, "Si": 28.085,
+    "P": 30.974, "S": 32.06, "Cl": 35.45, "Ar": 39.948, "K": 39.098,
+    "Ca": 40.078, "Sc": 44.956, "Ti": 47.867, "V": 50.942,
+    "Cr": 51.996, "Mn": 54.938, "Fe": 55.845, "Co": 58.933,
+    "Ni": 58.693, "Cu": 63.546, "Zn": 65.38, "Ga": 69.723,
+    "Ge": 72.630, "As": 74.922, "Se": 78.971, "Br": 79.904,
+    "Kr": 83.798, "Rb": 85.468, "Sr": 87.62, "Ag": 107.87,
+    "Sn": 118.71, "I": 126.90, "Ba": 137.33, "W": 183.84,
+    "Pt": 195.08, "Au": 196.97, "Hg": 200.59, "Pb": 207.2,
+    "U": 238.03,
+}
+# Longest arrows first so "<->" is replaced before "->".
+ARROWS: list[str] = ["<->", "-->", "->", "=>", "→", "="]
+SUBSCRIPT_DIGITS: str = "₀₁₂₃₄₅₆₇₈₉"
+DIGITS: str = "0123456789"
+
+
+def gcd(first: int, second: int) -> int:
+    """Return the greatest common divisor of two whole numbers."""
+    first = abs(first)
+    second = abs(second)
+    while second != 0:
+        first, second = second, first % second
+    return first
+
+
+def lcm(first: int, second: int) -> int:
+    """Return the least common multiple of two positive whole numbers."""
+    return first // gcd(first, second) * second
+
+
+def to_subscript(formula: str) -> str:
+    """Return the formula with every digit written as a subscript.
+
+    Example: "H2O" becomes "H₂O".
+    """
+    result = ""
+    for character in formula:
+        if character in DIGITS:
+            result += SUBSCRIPT_DIGITS[DIGITS.index(character)]
+        else:
+            result += character
+    return result
+
+
+def strip_coefficient(term: str) -> str:
+    """Remove spaces and any leading coefficient from one term.
+
+    Example: " 2 H2O" becomes "H2O".
+    """
+    squeezed = "".join(term.split())
+    position = 0
+    while position < len(squeezed) and squeezed[position] in DIGITS:
+        position += 1
+    return squeezed[position:]
+
+
+def split_side(side: str) -> list[str]:
+    """Split one side of an equation into its formulas.
+
+    Raises ValueError if a formula is missing (like "H2 + -> H2O").
+    """
+    formulas = []
+    for term in side.split("+"):
+        formula = strip_coefficient(term)
+        if formula == "":
+            raise ValueError(
+                "Each side needs formulas separated by + signs."
+            )
+        formulas.append(formula)
+    return formulas
+
+
+def split_equation(text: str) -> tuple[list[str], list[str]]:
+    """Split equation text into (reactant formulas, product formulas).
+
+    Accepts ->, -->, =>, = or → as the arrow.
+    Raises ValueError if there is not exactly one arrow.
+    """
+    cleaned = text
+    for arrow in ARROWS:
+        cleaned = cleaned.replace(arrow, "~")
+    if cleaned.count("~") != 1:
+        raise ValueError(
+            "Use exactly one arrow, like H2 + O2 -> H2O."
+        )
+    sides = cleaned.split("~")
+    return split_side(sides[0]), split_side(sides[1])
+
+
+def read_number(text: str, start: int) -> tuple[int, int]:
+    """Read a whole number starting at position start.
+
+    Returns (number, next position).  If there are no digits the number
+    is 1, because "O" means the same as "O1" in a formula.
+    """
+    position = start
+    while position < len(text) and text[position] in DIGITS:
+        position += 1
+    if position == start:
+        return 1, start
+    return int(text[start:position]), position
+
+
+def add_atoms(counts: dict[str, int], symbol: str, amount: int) -> None:
+    """Add amount atoms of symbol into the counts dictionary."""
+    counts[symbol] = counts.get(symbol, 0) + amount
+
+
+def parse_formula(formula: str) -> dict[str, int]:
+    """Count the atoms of each element in a formula.
+
+    Handles parentheses, so "Ca(OH)2" gives {"Ca": 1, "O": 2, "H": 2}.
+    Uses a stack: every "(" starts a new group of counts and every ")"
+    multiplies that group and merges it into the group below it.
+    Raises ValueError for unknown elements or bad characters.
+    """
+    stack = [{}]
+    position = 0
+    while position < len(formula):
+        character = formula[position]
+        if character == "(":
+            stack.append({})
+            position += 1
+        elif character == ")":
+            if len(stack) < 2:
+                raise ValueError("Unmatched ) in " + formula + ".")
+            group = stack.pop()
+            amount, position = read_number(formula, position + 1)
+            if amount == 0:
+                raise ValueError("A subscript cannot be 0.")
+            for symbol in group:
+                add_atoms(stack[-1], symbol, group[symbol] * amount)
+        elif character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            symbol = character
+            position += 1
+            if position < len(formula) and formula[position].islower():
+                symbol += formula[position]
+                position += 1
+            if symbol not in ATOMIC_MASSES:
+                raise ValueError(
+                    "I don't know the element " + symbol + " in "
+                    + formula + ". Check your capital letters."
+                )
+            amount, position = read_number(formula, position)
+            if amount == 0:
+                raise ValueError("A subscript cannot be 0.")
+            add_atoms(stack[-1], symbol, amount)
+        else:
+            raise ValueError(
+                "Unexpected '" + character + "' in " + formula + "."
+            )
+    if len(stack) != 1:
+        raise ValueError("Unmatched ( in " + formula + ".")
+    return stack[0]
+
+
+def molar_mass(elements: dict[str, int]) -> float:
+    """Return the molar mass (g/mol) for a dictionary of atom counts."""
+    total = 0.0
+    for symbol in elements:
+        total += ATOMIC_MASSES[symbol] * elements[symbol]
+    return total
+
+
+def build_matrix(
+    reactants: list[dict[str, int]], products: list[dict[str, int]]
+) -> list[list[int]]:
+    """Build the atom-count matrix (one row per element).
+
+    Reactant columns are positive, product columns are negative.
+    """
+    symbols = []
+    for species in reactants + products:
+        for symbol in species:
+            if symbol not in symbols:
+                symbols.append(symbol)
+    matrix = []
+    for symbol in symbols:
+        row = []
+        for species in reactants:
+            row.append(species.get(symbol, 0))
+        for species in products:
+            row.append(-species.get(symbol, 0))
+        matrix.append(row)
+    return matrix
+
+
+def reduce_row(row: list[int]) -> list[int]:
+    """Divide a row by the gcd of its entries to keep numbers small."""
+    divisor = 0
+    for value in row:
+        divisor = gcd(divisor, value)
+    if divisor > 1:
+        return [value // divisor for value in row]
+    return row
+
+
+def row_reduce(matrix: list[list[int]]) -> tuple[list[list[int]], list[int]]:
+    """Gaussian elimination using only whole numbers.
+
+    Returns (reduced rows, list of pivot columns).  Each pivot column has
+    exactly one non-zero entry (the pivot) after reduction.
+    """
+    rows = [row[:] for row in matrix]
+    pivots = []
+    pivot_row = 0
+    for column in range(len(rows[0])):
+        if pivot_row >= len(rows):
+            break
+        found = -1
+        for candidate in range(pivot_row, len(rows)):
+            if rows[candidate][column] != 0:
+                found = candidate
+                break
+        if found == -1:
+            continue
+        rows[pivot_row], rows[found] = rows[found], rows[pivot_row]
+        pivot_value = rows[pivot_row][column]
+        for other in range(len(rows)):
+            factor = rows[other][column]
+            if other != pivot_row and factor != 0:
+                for spot in range(len(rows[other])):
+                    rows[other][spot] = (
+                        rows[other][spot] * pivot_value
+                        - rows[pivot_row][spot] * factor
+                    )
+                rows[other] = reduce_row(rows[other])
+        pivots.append(column)
+        pivot_row += 1
+    return rows, pivots
+
+
+def find_coefficients(matrix: list[list[int]]) -> list[int]:
+    """Return the smallest whole-number coefficients that balance.
+
+    Raises ValueError if the equation cannot be balanced, or if there is
+    more than one way to balance it.
+    """
+    rows, pivots = row_reduce(matrix)
+    free_columns = []
+    for column in range(len(matrix[0])):
+        if column not in pivots:
+            free_columns.append(column)
+    if len(free_columns) == 0:
+        raise ValueError(
+            "This equation cannot be balanced. Check the formulas."
+        )
+    if len(free_columns) > 1:
+        raise ValueError(
+            "This equation can be balanced in more than one way. "
+            "Check that every formula belongs in the reaction."
+        )
+    free = free_columns[0]
+    scale = 1
+    for index in range(len(pivots)):
+        pivot_size = abs(rows[index][pivots[index]])
+        free_size = abs(rows[index][free])
+        scale = lcm(scale, pivot_size // gcd(pivot_size, free_size))
+    coefficients = [0] * len(matrix[0])
+    coefficients[free] = scale
+    for index in range(len(pivots)):
+        pivot_value = rows[index][pivots[index]]
+        coefficients[pivots[index]] = (
+            -rows[index][free] * scale // pivot_value
+        )
+    return clean_coefficients(coefficients)
+
+
+def clean_coefficients(coefficients: list[int]) -> list[int]:
+    """Make coefficients positive and in lowest terms.
+
+    Raises ValueError if any coefficient would be zero or if the signs
+    are mixed (the reaction cannot happen with these formulas).
+    """
+    if coefficients[0] < 0:
+        coefficients = [-value for value in coefficients]
+    divisor = 0
+    for value in coefficients:
+        if value <= 0:
+            raise ValueError(
+                "This equation cannot be balanced with whole numbers. "
+                "Check that each element appears on both sides."
+            )
+        divisor = gcd(divisor, value)
+    return [value // divisor for value in coefficients]
 
 
 @dataclass
@@ -46,6 +358,10 @@ def new_state() -> State:
     return State("", "", [], 0.0, 0.0, 0.0, "", "", "", False)
 
 
+# ---------------------------------------------------------------------
+# Helper functions (no Drafter pages in here)
+# ---------------------------------------------------------------------
+
 def parse_number(text: str) -> float:
     """Turn text into a float, or return 0.0 if it is not a usable number.
 
@@ -63,6 +379,7 @@ def parse_number(text: str) -> float:
 def format_number(value: float, places: int) -> str:
     """Round a number for display."""
     return str(round(value, places))
+
 
 def build_components(equation_text: str) -> list[ChemicalComponent]:
     """Balance the equation and return one component per formula.
@@ -274,6 +591,9 @@ def yield_details(state: State) -> list[str]:
     ]
 
 
+# ---------------------------------------------------------------------
+# Page builders (plain functions so a warning can be passed in)
+# ---------------------------------------------------------------------
 
 def make_balance_page(state: State, message: str) -> Page:
     """Build the balance page, showing a warning if message is not blank."""
@@ -336,6 +656,9 @@ def make_yield_page(state: State, message: str) -> Page:
     return Page(state, content)
 
 
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
 
 @route
 def index(state: State) -> Page:
@@ -501,7 +824,13 @@ def return_home(state: State) -> Page:
     state.show_details = False
     return index(state)
 
-# Unit tests
+
+# ---------------------------------------------------------------------
+# Unit tests (they run each time the program starts)
+# ---------------------------------------------------------------------
+# Routes that only build a Page are tested by checking what they do to
+# the State.  Pages that contain random or purely visual content are
+# not compared line by line.
 
 assert_equal(parse_number("12.5"), 12.5)
 assert_equal(parse_number(" 3 "), 3.0)
@@ -551,7 +880,7 @@ assert_equal(
     "Both sides match, so the equation is balanced.")
 assert_equal(yield_details(new_state()), [])
 
-
+# Routes.
 assert_equal(
     balance_equation(new_state(), "H2 + O2 -> H2O").state.balanced_equation,
     "2 H₂ + O₂ → 2 H₂O")
@@ -598,315 +927,6 @@ assert_equal(return_home(
 assert_equal(choose_tool(new_state(), BALANCE_CHOICE).state.components, [])
 assert_equal(choose_tool(new_state(), YIELD_CHOICE).state.components, [])
 
-set_website_title("Chemistry Helper")
-set_site_information(
-    author="Elena Lewis",
-    description="Balance chemical equations and calculate percent yield.",
-    sources=[
-        "Drafter documentation: https://drafter-edu.github.io/drafter/",
-        "LLM conversation: llm_conversation.md",
-    ],
-    planning=["compsci_projectdesign.pdf"],
-    links=["https://github.com/ellewis-723/chemistry-helper"],
-)
-hide_debug_information()
-set_website_framed(False)
+
 start_server(new_state())
 
-"""PASTED BELOW IS MY CHEM.PY FILE THAT IS USED ++++++++++
-**********ADVANCED TECHNIQUE (not covered in class): 
-balancing an equation is done
-with linear algebra.  Each species (reactant or product) is a column of a
-matrix and each element is a row; the entry is how many atoms of that
-element are in one molecule (products are negative).  A set of
-coefficients balances the equation when the matrix times the coefficients
-equals zero."""
-
-ATOMIC_MASSES: dict[str, float] = {
-    "H": 1.008, "He": 4.0026, "Li": 6.94, "Be": 9.0122, "B": 10.81,
-    "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "Ne": 20.180,
-    "Na": 22.990, "Mg": 24.305, "Al": 26.982, "Si": 28.085,
-    "P": 30.974, "S": 32.06, "Cl": 35.45, "Ar": 39.948, "K": 39.098,
-    "Ca": 40.078, "Sc": 44.956, "Ti": 47.867, "V": 50.942,
-    "Cr": 51.996, "Mn": 54.938, "Fe": 55.845, "Co": 58.933,
-    "Ni": 58.693, "Cu": 63.546, "Zn": 65.38, "Ga": 69.723,
-    "Ge": 72.630, "As": 74.922, "Se": 78.971, "Br": 79.904,
-    "Kr": 83.798, "Rb": 85.468, "Sr": 87.62, "Ag": 107.87,
-    "Sn": 118.71, "I": 126.90, "Ba": 137.33, "W": 183.84,
-    "Pt": 195.08, "Au": 196.97, "Hg": 200.59, "Pb": 207.2,
-    "U": 238.03,
-}
-ARROWS: list[str] = ["<->", "-->", "->", "=>", "→", "="]
-SUBSCRIPT_DIGITS: str = "₀₁₂₃₄₅₆₇₈₉"
-DIGITS: str = "0123456789"
-
-
-def gcd(first: int, second: int) -> int:
-    """Return the greatest common divisor of two whole numbers."""
-    first = abs(first)
-    second = abs(second)
-    while second != 0:
-        first, second = second, first % second
-    return first
-
-
-def lcm(first: int, second: int) -> int:
-    """Return the least common multiple of two positive whole numbers."""
-    return first // gcd(first, second) * second
-
-
-def to_subscript(formula: str) -> str:
-    """Return the formula with every digit written as a subscript.
-
-    Example: "H2O" becomes "H₂O".
-    """
-    result = ""
-    for character in formula:
-        if character in DIGITS:
-            result += SUBSCRIPT_DIGITS[DIGITS.index(character)]
-        else:
-            result += character
-    return result
-
-
-def strip_coefficient(term: str) -> str:
-    """Remove spaces and any leading coefficient from one term.
-
-    Example: " 2 H2O" becomes "H2O".
-    """
-    squeezed = "".join(term.split())
-    position = 0
-    while position < len(squeezed) and squeezed[position] in DIGITS:
-        position += 1
-    return squeezed[position:]
-
-
-def split_side(side: str) -> list[str]:
-    """Split one side of an equation into its formulas.
-
-    Raises ValueError if a formula is missing (like "H2 + -> H2O").
-    """
-    formulas = []
-    for term in side.split("+"):
-        formula = strip_coefficient(term)
-        if formula == "":
-            raise ValueError(
-                "Each side needs formulas separated by + signs."
-            )
-        formulas.append(formula)
-    return formulas
-
-
-def split_equation(text: str) -> tuple[list[str], list[str]]:
-    """Split equation text into (reactant formulas, product formulas).
-
-    Accepts ->, -->, =>, = or → as the arrow.
-    Raises ValueError if there is not exactly one arrow.
-    """
-    cleaned = text
-    for arrow in ARROWS:
-        cleaned = cleaned.replace(arrow, "~")
-    if cleaned.count("~") != 1:
-        raise ValueError(
-            "Use exactly one arrow, like H2 + O2 -> H2O."
-        )
-    sides = cleaned.split("~")
-    return split_side(sides[0]), split_side(sides[1])
-
-
-def read_number(text: str, start: int) -> tuple[int, int]:
-    """Read a whole number starting at position start.
-
-    Returns (number, next position).  If there are no digits the number
-    is 1, because "O" means the same as "O1" in a formula.
-    """
-    position = start
-    while position < len(text) and text[position] in DIGITS:
-        position += 1
-    if position == start:
-        return 1, start
-    return int(text[start:position]), position
-
-
-def add_atoms(counts: dict[str, int], symbol: str, amount: int) -> None:
-    """Add amount atoms of symbol into the counts dictionary."""
-    counts[symbol] = counts.get(symbol, 0) + amount
-
-
-def parse_formula(formula: str) -> dict[str, int]:
-    """Count the atoms of each element in a formula.
-
-    Deals with parentheses, so "Ca(OH)2" gives {"Ca": 1, "O": 2, "H": 2}.
-    Uses a stack: every "(" starts a new group of counts and every ")"
-    multiplies that group and merges it into the group below it.
-    Raises ValueError for unknown elements or bad characters.
-    """
-    stack = [{}]
-    position = 0
-    while position < len(formula):
-        character = formula[position]
-        if character == "(":
-            stack.append({})
-            position += 1
-        elif character == ")":
-            if len(stack) < 2:
-                raise ValueError("Unmatched ) in " + formula + ".")
-            group = stack.pop()
-            amount, position = read_number(formula, position + 1)
-            if amount == 0:
-                raise ValueError("A subscript cannot be 0.")
-            for symbol in group:
-                add_atoms(stack[-1], symbol, group[symbol] * amount)
-        elif character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-            symbol = character
-            position += 1
-            if position < len(formula) and formula[position].islower():
-                symbol += formula[position]
-                position += 1
-            if symbol not in ATOMIC_MASSES:
-                raise ValueError(
-                    "I don't know the element " + symbol + " in "
-                    + formula + ". Check your capital letters."
-                )
-            amount, position = read_number(formula, position)
-            if amount == 0:
-                raise ValueError("A subscript cannot be 0.")
-            add_atoms(stack[-1], symbol, amount)
-        else:
-            raise ValueError(
-                "Unexpected '" + character + "' in " + formula + "."
-            )
-    if len(stack) != 1:
-        raise ValueError("Unmatched ( in " + formula + ".")
-    return stack[0]
-
-
-def molar_mass(elements: dict[str, int]) -> float:
-    """Return the molar mass (g/mol) for a dictionary of atom counts."""
-    total = 0.0
-    for symbol in elements:
-        total += ATOMIC_MASSES[symbol] * elements[symbol]
-    return total
-
-
-def build_matrix(
-    reactants: list[dict[str, int]], products: list[dict[str, int]]
-) -> list[list[int]]:
-    """Build the atom-count matrix (one row per element).
-
-    Reactant columns are positive, product columns are negative.
-    """
-    symbols = []
-    for species in reactants + products:
-        for symbol in species:
-            if symbol not in symbols:
-                symbols.append(symbol)
-    matrix = []
-    for symbol in symbols:
-        row = []
-        for species in reactants:
-            row.append(species.get(symbol, 0))
-        for species in products:
-            row.append(-species.get(symbol, 0))
-        matrix.append(row)
-    return matrix
-
-
-def reduce_row(row: list[int]) -> list[int]:
-    """Divide a row by the gcd of its entries to keep numbers small."""
-    divisor = 0
-    for value in row:
-        divisor = gcd(divisor, value)
-    if divisor > 1:
-        return [value // divisor for value in row]
-    return row
-
-
-def row_reduce(matrix: list[list[int]]) -> tuple[list[list[int]], list[int]]:
-    """elimination using only whole numbers.
-
-    Returns (reduced rows, list of pivot columns).  Each pivot column has
-    exactly one non-zero entry (the pivot) after reduction.
-    """
-    rows = [row[:] for row in matrix]
-    pivots = []
-    pivot_row = 0
-    for column in range(len(rows[0])):
-        if pivot_row >= len(rows):
-            break
-        found = -1
-        for candidate in range(pivot_row, len(rows)):
-            if rows[candidate][column] != 0:
-                found = candidate
-                break
-        if found == -1:
-            continue
-        rows[pivot_row], rows[found] = rows[found], rows[pivot_row]
-        pivot_value = rows[pivot_row][column]
-        for other in range(len(rows)):
-            factor = rows[other][column]
-            if other != pivot_row and factor != 0:
-                for spot in range(len(rows[other])):
-                    rows[other][spot] = (
-                        rows[other][spot] * pivot_value
-                        - rows[pivot_row][spot] * factor
-                    )
-                rows[other] = reduce_row(rows[other])
-        pivots.append(column)
-        pivot_row += 1
-    return rows, pivots
-
-
-def find_coefficients(matrix: list[list[int]]) -> list[int]:
-    """Return the smallest whole-number coefficients that balance.
-
-    Raises ValueError if the equation cannot be balanced, or if there is
-    more than one way to balance it.
-    """
-    rows, pivots = row_reduce(matrix)
-    free_columns = []
-    for column in range(len(matrix[0])):
-        if column not in pivots:
-            free_columns.append(column)
-    if len(free_columns) == 0:
-        raise ValueError(
-            "This equation cannot be balanced. Check the formulas."
-        )
-    if len(free_columns) > 1:
-        raise ValueError(
-            "This equation can be balanced in more than one way. "
-            "Check that every formula belongs in the reaction."
-        )
-    free = free_columns[0]
-    scale = 1
-    for index in range(len(pivots)):
-        pivot_size = abs(rows[index][pivots[index]])
-        free_size = abs(rows[index][free])
-        scale = lcm(scale, pivot_size // gcd(pivot_size, free_size))
-    coefficients = [0] * len(matrix[0])
-    coefficients[free] = scale
-    for index in range(len(pivots)):
-        pivot_value = rows[index][pivots[index]]
-        coefficients[pivots[index]] = (
-            -rows[index][free] * scale // pivot_value
-        )
-    return clean_coefficients(coefficients)
-
-
-def clean_coefficients(coefficients: list[int]) -> list[int]:
-    """Make coefficients positive and in lowest terms.
-
-    Raises ValueError if any coefficient would be zero or if the signs
-    are mixed (the reaction cannot happen with these formulas).
-    """
-    if coefficients[0] < 0:
-        coefficients = [-value for value in coefficients]
-    divisor = 0
-    for value in coefficients:
-        if value <= 0:
-            raise ValueError(
-                "This equation cannot be balanced with whole numbers. "
-                "Check that each element appears on both sides."
-            )
-        divisor = gcd(divisor, value)
-    return [value // divisor for value in coefficients]
